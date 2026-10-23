@@ -28,11 +28,15 @@ jobs:
         run: make
       - name: Show details
         run: |
-          echo "=== where defined ==="
-          grep -rn "ctr_get_mem_info\|ctr_svchack_successful\|__linear_heap_size\|__heap_size" core --include=*.c --include=*.h --include=*.S | head -40
-          echo "=== symbols ==="
-          $DEVKITARM/bin/arm-none-eabi-nm PSXctr.elf | grep -i -E "svchack|heap_size|stacksize|ctr_get_mem" || true
-          echo "=== values ==="
+          echo "=== Core memory helper ==="
+          sed -n '610,635p' core/frontend/libretro.c
+          echo "=== Symbol definitions ==="
+          grep -rn "__ctr_svchax\|ctr_get_mem_info\|ctr_svchack\|__linear_heap_size\|__heap_size" core --include='*.c' --include='*.h' --include='*.S' | head -60
+          echo "=== Linked symbols ==="
+          $DEVKITARM/bin/arm-none-eabi-nm -a PSXctr.elf | grep -i -E 'svchax|svchack|heap_size|stacksize|ctr_get_mem|log_mem_usage' || true
+          echo "=== Crash-site disassembly ==="
+          $DEVKITARM/bin/arm-none-eabi-objdump -d PSXctr.elf --start-address=0x1ebca0 --stop-address=0x1ebd10 || true
+          echo "=== Crash-site literal pool ==="
           $DEVKITARM/bin/arm-none-eabi-objdump -s --start-address=0x1ebdd0 --stop-address=0x1ebde0 PSXctr.elf || true
       - name: Upload
         uses: actions/upload-artifact@v4
