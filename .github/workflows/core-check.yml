@@ -5,11 +5,15 @@ on:
   push:
     paths:
       - '.github/workflows/core-check.yml'
-      
+
 jobs:
   core-check:
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm
+    strategy:
+      fail-fast: false
+      matrix:
+        core: [notaz/pcsx_rearmed, libretro/pcsx_rearmed]
     steps:
       - name: Install tools
         run: |
@@ -17,9 +21,13 @@ jobs:
           apt-get install -y git make
       - name: Get core
         run: |
-          git clone --recursive https://github.com/notaz/pcsx_rearmed core
+          git clone --recursive https://github.com/${{ matrix.core }} core
           git -C core log -1 --format='Core commit: %H'
-      - name: Look for a 3DS target
-        run: grep -n "ctr" core/Makefile.libretro || echo "No ctr entry found"
+      - name: Inspect core
+        run: |
+          cat core/.gitmodules || true
+          ls core/deps || true
+          ls core/deps/arm-mem || true
+          ls core/frontend/3ds || true
       - name: Build for 3DS
         run: make -C core -f Makefile.libretro platform=ctr -j2
