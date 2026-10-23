@@ -2,7 +2,10 @@ name: Core check
 
 on:
   workflow_dispatch:
-
+  push:
+    paths:
+      - '.github/workflows/core-check.yml'
+      
 jobs:
   core-check:
     runs-on: ubuntu-latest
