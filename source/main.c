@@ -173,16 +173,17 @@ static bool env_cb(unsigned cmd, void *data)
 /* Video output                                               */
 /* --------------------------------------------------------- */
 
+
 static void video_cb(const void *data,
                      unsigned width,
                      unsigned height,
                      size_t pitch)
 {
     enum {
-        SCREEN_WIDTH = 400,
-        SCREEN_HEIGHT = 240,
-        GAME_WIDTH = 320,
-        GAME_HEIGHT = 240,
+        SCREEN_COLUMNS = 400,
+        SCREEN_ROWS = 240,
+        GAME_COLUMNS = 320,
+        GAME_ROWS = 240,
         X_OFFSET = 40
     };
 
@@ -192,32 +193,35 @@ static void video_cb(const void *data,
     unsigned x;
     unsigned y;
 
-    if (!data || width == 0 || height == 0)
+    if (!data || width == 0 || height == 0 || pitch == 0)
         return;
 
     framebuffer = (u16 *)gfxGetFramebuffer(
         GFX_TOP, GFX_LEFT, &fb_width, &fb_height
     );
 
-    if (!framebuffer || fb_width < SCREEN_WIDTH ||
-        fb_height < SCREEN_HEIGHT)
+    /*
+     * The returned framebuffer dimensions are expressed in its
+     * rotated memory orientation: 240 rows by 400 columns.
+     */
+    if (!framebuffer ||
+        fb_width < SCREEN_ROWS ||
+        fb_height < SCREEN_COLUMNS)
         return;
 
-    /*
-     * libretro video data uses pitch bytes per source row.
-     * The 3DS framebuffer is column-major and vertically reversed.
-     */
-    for (x = 0; x < GAME_WIDTH; x++) {
-        unsigned source_x = x * width / GAME_WIDTH;
-        u16 *column = framebuffer + (X_OFFSET + x) * SCREEN_HEIGHT;
+    for (x = 0; x < GAME_COLUMNS; x++) {
+        unsigned source_x = x * width / GAME_COLUMNS;
+        u16 *column =
+            framebuffer + (X_OFFSET + x) * SCREEN_ROWS;
 
-        for (y = 0; y < GAME_HEIGHT; y++) {
-            unsigned source_y = y * height / GAME_HEIGHT;
+        for (y = 0; y < GAME_ROWS; y++) {
+            unsigned source_y = y * height / GAME_ROWS;
             const u16 *source_row = (const u16 *)(
-                (const uint8_t *)data + (size_t)source_y * pitch
+                (const uint8_t *)data +
+                (size_t)source_y * pitch
             );
 
-            column[SCREEN_HEIGHT - 1 - y] = source_row[source_x];
+            column[SCREEN_ROWS - 1 - y] = source_row[source_x];
         }
     }
 }
