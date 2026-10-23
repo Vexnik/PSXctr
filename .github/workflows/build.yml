@@ -26,14 +26,14 @@ jobs:
         run: make -C core -f Makefile.libretro platform=ctr -j2
       - name: Build app
         run: make
-      - name: Show function details
+      - name: Show details
         run: |
-          echo "=== uses ==="
-          grep -n "log_mem_usage" core/frontend/libretro.c || true
-          echo "=== source ==="
-          grep -n -B2 -A28 "^static void log_mem_usage" core/frontend/libretro.c || true
-          echo "=== machine code ==="
-          $DEVKITARM/bin/arm-none-eabi-objdump -d --start-address=0x1ebcb0 --stop-address=0x1ebd00 PSXctr.elf || true
+          echo "=== where defined ==="
+          grep -rn "ctr_get_mem_info\|ctr_svchack_successful\|__linear_heap_size\|__heap_size" core --include=*.c --include=*.h --include=*.S | head -40
+          echo "=== symbols ==="
+          $DEVKITARM/bin/arm-none-eabi-nm PSXctr.elf | grep -i -E "svchack|heap_size|stacksize|ctr_get_mem" || true
+          echo "=== values ==="
+          $DEVKITARM/bin/arm-none-eabi-objdump -s --start-address=0x1ebdd0 --stop-address=0x1ebde0 PSXctr.elf || true
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
