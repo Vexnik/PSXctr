@@ -26,18 +26,19 @@ jobs:
         run: make -C core -f Makefile.libretro platform=ctr -j2
       - name: Build app
         run: make
-      - name: Show details
+      - name: Show core platform code
         run: |
-          echo "=== Core memory helper ==="
-          sed -n '610,635p' core/frontend/libretro.c
-          echo "=== Symbol definitions ==="
-          grep -rn "__ctr_svchax\|ctr_get_mem_info\|ctr_svchack\|__linear_heap_size\|__heap_size" core --include='*.c' --include='*.h' --include='*.S' | head -60
-          echo "=== Linked symbols ==="
-          $DEVKITARM/bin/arm-none-eabi-nm -a PSXctr.elf | grep -i -E 'svchax|svchack|heap_size|stacksize|ctr_get_mem|log_mem_usage' || true
-          echo "=== Crash-site disassembly ==="
-          $DEVKITARM/bin/arm-none-eabi-objdump -d PSXctr.elf --start-address=0x1ebca0 --stop-address=0x1ebd10 || true
-          echo "=== Crash-site literal pool ==="
-          $DEVKITARM/bin/arm-none-eabi-objdump -s --start-address=0x1ebdd0 --stop-address=0x1ebde0 PSXctr.elf || true
+          echo "=== files ==="
+          ls -la core/frontend/3ds
+          for f in core/frontend/3ds/*; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cat "$f"
+          done
+          echo "=== uses of __ctr_svchax ==="
+          grep -rn -C6 "__ctr_svchax" core --include=*.c --include=*.h | head -300
+          echo "=== memory and cache helpers ==="
+          grep -rn -C3 "ctr_flush_invalidate_cache\|pl_3ds_mmap\|pl_3ds_munmap" core --include=*.c --include=*.h | head -200
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
