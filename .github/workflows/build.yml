@@ -26,11 +26,14 @@ jobs:
         run: make -C core -f Makefile.libretro platform=ctr -j2
       - name: Build app
         run: make
-      - name: Locate crash address
+      - name: Show function details
         run: |
-          grep -B1 -E ' 0x0*1eb[0-9a-f]{3}[[:space:]]' PSXctr.map || true
-          echo ------
-          grep -B1 -E ' 0x0*1f2[0-9a-f]{3}[[:space:]]' PSXctr.map || true
+          echo "=== uses ==="
+          grep -n "log_mem_usage" core/frontend/libretro.c || true
+          echo "=== source ==="
+          grep -n -B2 -A28 "^static void log_mem_usage" core/frontend/libretro.c || true
+          echo "=== machine code ==="
+          $DEVKITARM/bin/arm-none-eabi-objdump -d --start-address=0x1ebcb0 --stop-address=0x1ebd00 PSXctr.elf || true
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
