@@ -1,4 +1,3 @@
-
 #include <3ds.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -22,36 +21,46 @@
 #define AUDIO_BUFFER_FRAMES 2048
 #define AUDIO_SAMPLE_RATE   44100.0f
 
+#define STATS_SECONDS 5
+#define TICKS_TO_US(t) ((unsigned)(((unsigned long long)(t) * 1000000ULL) / SYSCLOCK_ARM11))
+
 u32 __stacksize__ = 0x100000;
 
-/*
- * Keep this disabled unless the matching 3DS privileged-memory
- * initialization is implemented and verified.
- *
- * Setting this to 1 by itself can cause memory-management failures.
- */
+/* Leave at 0: the core's privileged-memory paths are not set up. */
 int __ctr_svchax = 0;
 
 static FILE *logfile;
 static volatile int quit_requested;
 
-/* Audio buffers must reside in linear memory for NDSP. */
 static ndspWaveBuf audio_wavebufs[AUDIO_BUFFER_COUNT];
 static int16_t *audio_buffers[AUDIO_BUFFER_COUNT];
 static bool audio_ready;
 static bool audio_initialized;
 
+static unsigned long long stat_run, stat_video, stat_audio, stat_wait;
+static unsigned stat_frames, stat_audio_dropped;
+
 /* --------------------------------------------------------- */
 /* Logging                                                   */
 /* --------------------------------------------------------- */
 
+static void log_printf(const char *fmt, ...)
+{
+    va_list args;
+
+    if (!logfile)
+        return;
+
+    va_start(args, fmt);
+    vfprintf(logfile, fmt, args);
+    va_end(args);
+
+    fflush(logfile);
+}
+
 static void log_stage(const char *message)
 {
-    if (logfile) {
-        fprintf(logfile, "[PSXctr] %s\n", message);
-        fflush(logfile);
-    }
-
+    log_printf("[PSXctr] %s\n", message);
     printf("[PSXctr] %s\n", message);
 }
 
@@ -71,22 +80,43 @@ static void log_cb(enum retro_log_level level, const char *fmt, ...)
     fflush(logfile);
 }
 
+static void report_stats(unsigned long long elapsed)
+{
+    unsigned frames = stat_frames;
+    unsigned fps10;
+    unsigned run_us, video_us, audio_us, wait_us;
+
+    if (frames == 0 || elapsed == 0)
+        return;
+
+    fps10 = (unsigned)(((unsigned long long)frames * 10ULL *
+                        SYSCLOCK_ARM11) / elapsed);
+    run_us = TICKS_TO_US(stat_run / frames);
+    video_us = TICKS_TO_US(stat_video / frames);
+    audio_us = TICKS_TO_US(stat_audio / frames);
+    wait_us = TICKS_TO_US(stat_wait / frames);
+
+    log_printf("[PSXctr] Stats: %u.%u fps | per frame: run %u us "
+               "(video %u, audio %u), vblank wait %u us | "
+               "audio frames dropped %u\n",
+               fps10 / 10, fps10 % 10, run_us, video_us, audio_us,
+               wait_us, stat_audio_dropped);
+    printf("%u.%u fps\n", fps10 / 10, fps10 % 10);
+
+    stat_run = stat_video = stat_audio = stat_wait = 0;
+    stat_frames = 0;
+    stat_audio_dropped = 0;
+}
+
 /* --------------------------------------------------------- */
 /* Core options                                               */
 /* --------------------------------------------------------- */
 
-/*
- * This frontend currently exposes a small, fixed set of core
- * variables. The strings must remain valid after this callback
- * returns, so they are static string literals.
- *
- * IMPORTANT:
- * Requesting the DRC option does not override the core's separate
- * __ctr_svchax safety check. With __ctr_svchax == 0, this pinned
- * core still selects the interpreter on 3DS.
- */
 static bool env_cb(unsigned cmd, void *data)
 {
+    static bool logged_cpu_time;
+    static bool logged_drc;
+
     switch (cmd) {
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:
         if (!data)
@@ -133,24 +163,28 @@ static bool env_cb(unsigned cmd, void *data)
 
         variable->value = NULL;
 
-        /*
-         * Give the emulator more of the system CPU-time budget.
-         * This may help scheduling and audio responsiveness, but
-         * cannot replace the dynamic recompiler.
-         */
         if (strcmp(variable->key,
                    "pcsx_rearmed_3ds_appcputime") == 0) {
             variable->value = "80";
+
+            if (!logged_cpu_time) {
+                logged_cpu_time = true;
+                log_printf("[PSXctr] Option: %s = %s\n",
+                           variable->key, variable->value);
+            }
+
             return true;
         }
 
-        /*
-         * Request the normal DRC option value. The pinned core
-         * separately checks __ctr_svchax and overrides this when
-         * privileged access is unavailable.
-         */
         if (strcmp(variable->key, "pcsx_rearmed_drc") == 0) {
             variable->value = "enabled";
+
+            if (!logged_drc) {
+                logged_drc = true;
+                log_printf("[PSXctr] Option: %s = %s\n",
+                           variable->key, variable->value);
+            }
+
             return true;
         }
 
@@ -173,11 +207,10 @@ static bool env_cb(unsigned cmd, void *data)
 /* Video output                                               */
 /* --------------------------------------------------------- */
 
-
-static void video_cb(const void *data,
-                     unsigned width,
-                     unsigned height,
-                     size_t pitch)
+static void draw_frame(const void *data,
+                       unsigned width,
+                       unsigned height,
+                       size_t pitch)
 {
     enum {
         SCREEN_COLUMNS = 400,
@@ -200,10 +233,7 @@ static void video_cb(const void *data,
         GFX_TOP, GFX_LEFT, &fb_width, &fb_height
     );
 
-    /*
-     * The returned framebuffer dimensions are expressed in its
-     * rotated memory orientation: 240 rows by 400 columns.
-     */
+    /* The framebuffer is rotated in memory: 240 rows by 400 columns. */
     if (!framebuffer ||
         fb_width < SCREEN_ROWS ||
         fb_height < SCREEN_COLUMNS)
@@ -226,6 +256,18 @@ static void video_cb(const void *data,
     }
 }
 
+static void video_cb(const void *data,
+                     unsigned width,
+                     unsigned height,
+                     size_t pitch)
+{
+    u64 start = svcGetSystemTick();
+
+    draw_frame(data, width, height, pitch);
+
+    stat_video += svcGetSystemTick() - start;
+}
+
 /* --------------------------------------------------------- */
 /* Audio output                                               */
 /* --------------------------------------------------------- */
@@ -244,13 +286,8 @@ static bool audio_init(void)
     result = ndspInit();
 
     if (R_FAILED(result)) {
-        if (logfile) {
-            fprintf(logfile,
-                    "[PSXctr] Audio: ndspInit failed: 0x%08lX\n",
-                    (unsigned long)result);
-            fflush(logfile);
-        }
-
+        log_printf("[PSXctr] Audio: ndspInit failed: 0x%08lX\n",
+                   (unsigned long)result);
         return false;
     }
 
@@ -281,11 +318,7 @@ static bool audio_init(void)
         if (!audio_buffers[i]) {
             unsigned j;
 
-            if (logfile) {
-                fprintf(logfile,
-                        "[PSXctr] Audio: buffer allocation failed\n");
-                fflush(logfile);
-            }
+            log_printf("[PSXctr] Audio: buffer allocation failed\n");
 
             for (j = 0; j < i; j++) {
                 linearFree(audio_buffers[j]);
@@ -304,7 +337,7 @@ static bool audio_init(void)
     return true;
 }
 
-static size_t audio_batch_cb(const int16_t *data, size_t frames)
+static size_t audio_queue(const int16_t *data, size_t frames)
 {
     size_t consumed = 0;
 
@@ -325,10 +358,7 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames)
             }
         }
 
-        /*
-         * Do not overwrite a buffer currently being played.
-         * If all buffers are busy, return only the frames queued.
-         */
+        /* All buffers busy: report only what was queued. */
         if (slot < 0)
             break;
 
@@ -358,11 +388,24 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames)
     return consumed;
 }
 
+static size_t audio_batch_cb(const int16_t *data, size_t frames)
+{
+    u64 start = svcGetSystemTick();
+    size_t consumed = audio_queue(data, frames);
+
+    stat_audio += svcGetSystemTick() - start;
+
+    if (consumed < frames)
+        stat_audio_dropped += (unsigned)(frames - consumed);
+
+    return consumed;
+}
+
 static void audio_cb(int16_t left, int16_t right)
 {
     const int16_t sample[2] = { left, right };
 
-    (void)audio_batch_cb(sample, 1);
+    (void)audio_queue(sample, 1);
 }
 
 static void audio_shutdown(void)
@@ -418,46 +461,32 @@ static int16_t input_state_cb(unsigned port,
     switch (id) {
     case RETRO_DEVICE_ID_JOYPAD_UP:
         return !!(held & (KEY_DUP | KEY_CPAD_UP));
-
     case RETRO_DEVICE_ID_JOYPAD_DOWN:
         return !!(held & (KEY_DDOWN | KEY_CPAD_DOWN));
-
     case RETRO_DEVICE_ID_JOYPAD_LEFT:
         return !!(held & (KEY_DLEFT | KEY_CPAD_LEFT));
-
     case RETRO_DEVICE_ID_JOYPAD_RIGHT:
         return !!(held & (KEY_DRIGHT | KEY_CPAD_RIGHT));
-
     case RETRO_DEVICE_ID_JOYPAD_A:
         return !!(held & KEY_A);
-
     case RETRO_DEVICE_ID_JOYPAD_B:
         return !!(held & KEY_B);
-
     case RETRO_DEVICE_ID_JOYPAD_X:
         return !!(held & KEY_X);
-
     case RETRO_DEVICE_ID_JOYPAD_Y:
         return !!(held & KEY_Y);
-
     case RETRO_DEVICE_ID_JOYPAD_L:
         return !!(held & KEY_L);
-
     case RETRO_DEVICE_ID_JOYPAD_R:
         return !!(held & KEY_R);
-
     case RETRO_DEVICE_ID_JOYPAD_L2:
         return !!(held & KEY_ZL);
-
     case RETRO_DEVICE_ID_JOYPAD_R2:
         return !!(held & KEY_ZR);
-
     case RETRO_DEVICE_ID_JOYPAD_START:
         return !!(held & KEY_START);
-
     case RETRO_DEVICE_ID_JOYPAD_SELECT:
         return !!(held & KEY_SELECT);
-
     default:
         return 0;
     }
@@ -535,6 +564,16 @@ int main(void)
     u16 fb_height;
     u8 *framebuffer;
 
+    mkdir(BASE_DIR, 0777);
+    mkdir(SYSTEM_DIR, 0777);
+    mkdir(SAVE_DIR, 0777);
+    logfile = fopen(LOG_PATH, "w");
+
+    log_stage("Startup: log opened");
+    log_printf("[PSXctr] Config: __ctr_svchax=%d "
+               "(0 means the core uses the interpreter, "
+               "not the dynamic recompiler)\n", __ctr_svchax);
+
     log_stage("Startup: enabling 3DS speedup");
     osSetSpeedupEnable(true);
 
@@ -545,8 +584,6 @@ int main(void)
     gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
     consoleInit(GFX_BOTTOM, NULL);
 
-    log_stage("Startup: clearing top screen");
-
     framebuffer = gfxGetFramebuffer(
         GFX_TOP, GFX_LEFT, &fb_width, &fb_height
     );
@@ -555,38 +592,19 @@ int main(void)
         memset(framebuffer, 0,
                (size_t)fb_width * fb_height * sizeof(u16));
 
-    log_stage("Startup: creating application directories");
-
-    mkdir(BASE_DIR, 0777);
-    mkdir(SYSTEM_DIR, 0777);
-    mkdir(SAVE_DIR, 0777);
-
-    logfile = fopen(LOG_PATH, "w");
-
     printf("PSXctr\n\n");
-    log_stage("Startup: frontend initialized; log opened");
 
     log_stage("Audio: initializing NDSP");
 
     if (!audio_init())
         log_stage("Audio: unavailable; continuing without sound");
 
-    log_stage("Core: registering environment callback");
+    log_stage("Core: registering callbacks");
     retro_set_environment(env_cb);
-
-    log_stage("Core: registering video callback");
     retro_set_video_refresh(video_cb);
-
-    log_stage("Core: registering audio callback");
     retro_set_audio_sample(audio_cb);
-
-    log_stage("Core: registering audio batch callback");
     retro_set_audio_sample_batch(audio_batch_cb);
-
-    log_stage("Core: registering input poll callback");
     retro_set_input_poll(input_poll_cb);
-
-    log_stage("Core: registering input state callback");
     retro_set_input_state(input_state_cb);
 
     log_stage("Core: entering retro_init");
@@ -603,30 +621,58 @@ int main(void)
         log_stage("Core: entering retro_load_game");
 
         if (retro_load_game(&game)) {
+            u64 report_start;
+
             log_stage("Core: retro_load_game completed successfully");
 
-            log_stage("Core: querying system AV information");
             retro_get_system_av_info(&av);
-
-            log_stage("Core: setting joypad controller");
             retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
 
-            printf("Running %ux%u at %.2f fps\n",
-                   av.geometry.base_width,
-                   av.geometry.base_height,
-                   av.timing.fps);
+            log_printf("[PSXctr] AV: %ux%u, core reports %u fps x100\n",
+                       av.geometry.base_width,
+                       av.geometry.base_height,
+                       (unsigned)(av.timing.fps * 100.0));
 
-            printf("Exit: hold L+R+START+SELECT\n");
+            printf("Exit: hold L+R+START+SELECT\n\n");
 
             log_stage("Emulation: entering retro_run loop");
 
+            stat_run = stat_video = stat_audio = stat_wait = 0;
+            stat_frames = 0;
+            stat_audio_dropped = 0;
+            report_start = svcGetSystemTick();
+
             while (aptMainLoop() && !quit_requested) {
+                u64 t0 = svcGetSystemTick();
+                u64 t1;
+                u64 t2;
+
                 retro_run();
+
+                t1 = svcGetSystemTick();
 
                 gfxFlushBuffers();
                 gfxSwapBuffers();
                 gspWaitForVBlank();
+
+                t2 = svcGetSystemTick();
+
+                stat_run += t1 - t0;
+                stat_wait += t2 - t1;
+                stat_frames++;
+
+                if (t2 - report_start >=
+                    (u64)SYSCLOCK_ARM11 * STATS_SECONDS) {
+                    report_stats(t2 - report_start);
+                    report_start = t2;
+                }
             }
+
+            report_stats(svcGetSystemTick() - report_start);
+
+            log_stage(quit_requested ?
+                      "Exit: button combination pressed" :
+                      "Exit: system requested shutdown");
 
             log_stage("Core: unloading game");
             retro_unload_game();
@@ -657,9 +703,9 @@ int main(void)
     log_stage("Audio: shutting down");
     audio_shutdown();
 
+    log_stage("Shutdown: closing log");
+
     if (logfile) {
-        fprintf(logfile, "[PSXctr] Shutdown: closing log\n");
-        fflush(logfile);
         fclose(logfile);
         logfile = NULL;
     }
