@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
@@ -9,13 +11,13 @@
 
 #include "libretro.h"
 
-#define BASE_DIR   "sdmc:/3ds/PSXctr"
-#define SYSTEM_DIR BASE_DIR "/system"
-#define SAVE_DIR   BASE_DIR "/saves"
-#define LOG_PATH   BASE_DIR "/log.txt"
-#define ROM_DIR    "sdmc:/roms/psx"
-
-#define EXIT_COMBO (KEY_L | KEY_R | KEY_START | KEY_SELECT)
+#define BASE_DIR        "sdmc:/3ds/PSXctr"
+#define SYSTEM_DIR      BASE_DIR "/system"
+#define SAVE_DIR        BASE_DIR "/saves"
+#define LOG_PATH        BASE_DIR "/log.txt"
+#define NO_DYNAREC_PATH BASE_DIR "/no_dynarec"
+#define PENDING_PATH    BASE_DIR "/dynarec_pending"
+#define ROM_DIR         "sdmc:/roms/psx"
 
 #define AUDIO_BUFFER_COUNT  3
 #define AUDIO_BUFFER_FRAMES 2048
@@ -26,11 +28,10 @@
 
 u32 __stacksize__ = 0x100000;
 
-/* Leave at 0: the core's privileged-memory paths are not set up. */
+/* Set to 1 at startup only if the capability checks pass. */
 int __ctr_svchax = 0;
 
 static FILE *logfile;
-static volatile int quit_requested;
 
 static ndspWaveBuf audio_wavebufs[AUDIO_BUFFER_COUNT];
 static int16_t *audio_buffers[AUDIO_BUFFER_COUNT];
@@ -96,9 +97,10 @@ static void report_stats(unsigned long long elapsed)
     audio_us = TICKS_TO_US(stat_audio / frames);
     wait_us = TICKS_TO_US(stat_wait / frames);
 
-    log_printf("[PSXctr] Stats: %u.%u fps | per frame: run %u us "
+    log_printf("[PSXctr] Stats (%s): %u.%u fps | per frame: run %u us "
                "(video %u, audio %u), vblank wait %u us | "
                "audio frames dropped %u\n",
+               __ctr_svchax ? "dynarec" : "interpreter",
                fps10 / 10, fps10 % 10, run_us, video_us, audio_us,
                wait_us, stat_audio_dropped);
     printf("%u.%u fps\n", fps10 / 10, fps10 % 10);
@@ -106,6 +108,130 @@ static void report_stats(unsigned long long elapsed)
     stat_run = stat_video = stat_audio = stat_wait = 0;
     stat_frames = 0;
     stat_audio_dropped = 0;
+}
+
+/* --------------------------------------------------------- */
+/* Capability checks for the dynamic recompiler               */
+/* --------------------------------------------------------- */
+
+static bool file_exists(const char *path)
+{
+    struct stat st;
+
+    return stat(path, &st) == 0;
+}
+
+static void touch_file(const char *path)
+{
+    FILE *f = fopen(path, "w");
+
+    if (f)
+        fclose(f);
+}
+
+/* Runs in supervisor mode through Luma's custom backdoor call. */
+__attribute__((naked, target("arm")))
+static void kernel_probe(void)
+{
+    __asm__ volatile("mov r0, #0x42\n\tbx lr");
+}
+
+__attribute__((naked, target("arm")))
+static int custom_backdoor(void *callback, void *a0, void *a1, void *a2)
+{
+    __asm__ volatile("svc 0x80\n\tbx lr");
+}
+
+static bool probe_capabilities(void)
+{
+    s64 luma = 0;
+    Result res;
+    Handle self = 0;
+    void *page;
+    int value;
+    bool protect_ok;
+
+    res = svcGetSystemInfo(&luma, 0x10000, 0);
+
+    if (R_FAILED(res)) {
+        log_printf("[PSXctr] Probe: Luma3DS not detected (0x%08lX)\n",
+                   (unsigned long)res);
+        return false;
+    }
+
+    log_printf("[PSXctr] Probe: Luma3DS version value 0x%08lX\n",
+               (unsigned long)luma);
+
+    page = memalign(0x1000, 0x1000);
+
+    if (!page) {
+        log_printf("[PSXctr] Probe: test page allocation failed\n");
+        return false;
+    }
+
+    memset(page, 0, 0x1000);
+
+    res = svcDuplicateHandle(&self, CUR_PROCESS_HANDLE);
+
+    if (R_FAILED(res)) {
+        log_printf("[PSXctr] Probe: svcDuplicateHandle failed: 0x%08lX\n",
+                   (unsigned long)res);
+        free(page);
+        return false;
+    }
+
+    log_printf("[PSXctr] Probe: testing svcControlProcessMemory\n");
+
+    res = svcControlProcessMemory(self, (u32)page, 0, 0x1000, 6, 7);
+    protect_ok = R_SUCCEEDED(res);
+
+    log_printf("[PSXctr] Probe: svcControlProcessMemory result 0x%08lX\n",
+               (unsigned long)res);
+
+    if (protect_ok)
+        svcControlProcessMemory(self, (u32)page, 0, 0x1000, 6, 3);
+
+    svcCloseHandle(self);
+    free(page);
+
+    if (!protect_ok)
+        return false;
+
+    log_printf("[PSXctr] Probe: testing svcCustomBackdoor\n");
+
+    value = custom_backdoor((void *)kernel_probe, NULL, NULL, NULL);
+
+    log_printf("[PSXctr] Probe: svcCustomBackdoor returned 0x%X "
+               "(expected 0x42)\n", (unsigned)value);
+
+    return value == 0x42;
+}
+
+static void select_cpu_mode(void)
+{
+    if (file_exists(NO_DYNAREC_PATH)) {
+        log_printf("[PSXctr] Dynarec: disabled by the no_dynarec file\n");
+        return;
+    }
+
+    if (file_exists(PENDING_PATH)) {
+        touch_file(NO_DYNAREC_PATH);
+        remove(PENDING_PATH);
+        log_printf("[PSXctr] Dynarec: the previous dynarec run did not "
+                   "exit cleanly, so it is now disabled. Delete "
+                   "3ds/PSXctr/no_dynarec to try again.\n");
+        return;
+    }
+
+    if (!probe_capabilities()) {
+        log_printf("[PSXctr] Dynarec: capability checks failed; "
+                   "using the interpreter\n");
+        return;
+    }
+
+    touch_file(PENDING_PATH);
+    __ctr_svchax = 1;
+    log_printf("[PSXctr] Dynarec: capability checks passed; enabled\n");
 }
 
 /* --------------------------------------------------------- */
@@ -439,9 +565,6 @@ static void audio_shutdown(void)
 static void input_poll_cb(void)
 {
     hidScanInput();
-
-    if ((hidKeysHeld() & EXIT_COMBO) == EXIT_COMBO)
-        quit_requested = 1;
 }
 
 static int16_t input_state_cb(unsigned port,
@@ -570,12 +693,15 @@ int main(void)
     logfile = fopen(LOG_PATH, "w");
 
     log_stage("Startup: log opened");
-    log_printf("[PSXctr] Config: __ctr_svchax=%d "
-               "(0 means the core uses the interpreter, "
-               "not the dynamic recompiler)\n", __ctr_svchax);
 
     log_stage("Startup: enabling 3DS speedup");
     osSetSpeedupEnable(true);
+
+    log_stage("Startup: checking dynarec support");
+    select_cpu_mode();
+    log_printf("[PSXctr] Config: __ctr_svchax=%d (%s)\n",
+               __ctr_svchax,
+               __ctr_svchax ? "dynamic recompiler" : "interpreter");
 
     log_stage("Startup: initializing graphics");
     gfxInitDefault();
@@ -633,7 +759,7 @@ int main(void)
                        av.geometry.base_height,
                        (unsigned)(av.timing.fps * 100.0));
 
-            printf("Exit: hold L+R+START+SELECT\n\n");
+            printf("Close the game from the HOME menu.\n\n");
 
             log_stage("Emulation: entering retro_run loop");
 
@@ -642,7 +768,7 @@ int main(void)
             stat_audio_dropped = 0;
             report_start = svcGetSystemTick();
 
-            while (aptMainLoop() && !quit_requested) {
+            while (aptMainLoop()) {
                 u64 t0 = svcGetSystemTick();
                 u64 t1;
                 u64 t2;
@@ -670,9 +796,7 @@ int main(void)
 
             report_stats(svcGetSystemTick() - report_start);
 
-            log_stage(quit_requested ?
-                      "Exit: button combination pressed" :
-                      "Exit: system requested shutdown");
+            log_stage("Exit: system requested shutdown");
 
             log_stage("Core: unloading game");
             retro_unload_game();
@@ -702,6 +826,11 @@ int main(void)
 
     log_stage("Audio: shutting down");
     audio_shutdown();
+
+    if (__ctr_svchax) {
+        remove(PENDING_PATH);
+        log_stage("Dynarec: clean exit recorded");
+    }
 
     log_stage("Shutdown: closing log");
 
