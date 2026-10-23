@@ -1,0 +1,22 @@
+name: Core check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  core-check:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y git make
+      - name: Get core
+        run: |
+          git clone --recursive https://github.com/notaz/pcsx_rearmed core
+          git -C core log -1 --format='Core commit: %H'
+      - name: Look for a 3DS target
+        run: grep -n "ctr" core/Makefile.libretro || echo "No ctr entry found"
+      - name: Build for 3DS
+        run: make -C core -f Makefile.libretro platform=ctr -j2
