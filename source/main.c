@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
 #include "libretro.h"
 
 #define BASE_DIR   "sdmc:/3ds/PSXctr"
@@ -24,15 +25,17 @@
 u32 __stacksize__ = 0x100000;
 
 /*
- * PCSX-ReARMed declares this symbol as weak.
- * Keep it at zero unless privileged access is properly configured.
+ * Keep this disabled unless the matching 3DS privileged-memory
+ * initialization is implemented and verified.
+ *
+ * Setting this to 1 by itself can cause memory-management failures.
  */
 int __ctr_svchax = 0;
 
 static FILE *logfile;
 static volatile int quit_requested;
 
-/* NDSP audio output buffers. */
+/* Audio buffers must reside in linear memory for NDSP. */
 static ndspWaveBuf audio_wavebufs[AUDIO_BUFFER_COUNT];
 static int16_t *audio_buffers[AUDIO_BUFFER_COUNT];
 static bool audio_ready;
@@ -42,58 +45,122 @@ static bool audio_initialized;
 /* Logging                                                   */
 /* --------------------------------------------------------- */
 
-static void log_stage(const char *stage)
+static void log_stage(const char *message)
 {
     if (logfile) {
-        fprintf(logfile, "[PSXctr] %s\n", stage);
+        fprintf(logfile, "[PSXctr] %s\n", message);
         fflush(logfile);
     }
 
-    printf("%s\n", stage);
+    printf("[PSXctr] %s\n", message);
 }
 
 static void log_cb(enum retro_log_level level, const char *fmt, ...)
 {
-    va_list ap;
+    va_list args;
+
     (void)level;
 
     if (!logfile)
         return;
 
-    va_start(ap, fmt);
-    vfprintf(logfile, fmt, ap);
-    va_end(ap);
+    va_start(args, fmt);
+    vfprintf(logfile, fmt, args);
+    va_end(args);
+
     fflush(logfile);
 }
 
 /* --------------------------------------------------------- */
-/* Libretro environment                                      */
+/* Core options                                               */
 /* --------------------------------------------------------- */
 
+/*
+ * This frontend currently exposes a small, fixed set of core
+ * variables. The strings must remain valid after this callback
+ * returns, so they are static string literals.
+ *
+ * IMPORTANT:
+ * Requesting the DRC option does not override the core's separate
+ * __ctr_svchax safety check. With __ctr_svchax == 0, this pinned
+ * core still selects the interpreter on 3DS.
+ */
 static bool env_cb(unsigned cmd, void *data)
 {
     switch (cmd) {
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:
+        if (!data)
+            return false;
+
         *(bool *)data = true;
         return true;
 
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+        if (!data)
+            return false;
+
         return *(enum retro_pixel_format *)data ==
                RETRO_PIXEL_FORMAT_RGB565;
 
     case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+        if (!data)
+            return false;
+
         *(const char **)data = SYSTEM_DIR;
         return true;
 
     case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+        if (!data)
+            return false;
+
         *(const char **)data = SAVE_DIR;
         return true;
 
     case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
+        if (!data)
+            return false;
+
         ((struct retro_log_callback *)data)->log = log_cb;
         return true;
 
+    case RETRO_ENVIRONMENT_GET_VARIABLE:
+    {
+        struct retro_variable *variable =
+            (struct retro_variable *)data;
+
+        if (!variable || !variable->key)
+            return false;
+
+        variable->value = NULL;
+
+        /*
+         * Give the emulator more of the system CPU-time budget.
+         * This may help scheduling and audio responsiveness, but
+         * cannot replace the dynamic recompiler.
+         */
+        if (strcmp(variable->key,
+                   "pcsx_rearmed_3ds_appcputime") == 0) {
+            variable->value = "80";
+            return true;
+        }
+
+        /*
+         * Request the normal DRC option value. The pinned core
+         * separately checks __ctr_svchax and overrides this when
+         * privileged access is unavailable.
+         */
+        if (strcmp(variable->key, "pcsx_rearmed_drc") == 0) {
+            variable->value = "enabled";
+            return true;
+        }
+
+        return false;
+    }
+
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+        if (!data)
+            return false;
+
         *(bool *)data = false;
         return true;
 
@@ -103,38 +170,54 @@ static bool env_cb(unsigned cmd, void *data)
 }
 
 /* --------------------------------------------------------- */
-/* Video output                                              */
+/* Video output                                               */
 /* --------------------------------------------------------- */
 
-static void video_cb(const void *data, unsigned w, unsigned h,
+static void video_cb(const void *data,
+                     unsigned width,
+                     unsigned height,
                      size_t pitch)
 {
-    enum { DW = 320, DH = 240, XOFF = 40 };
+    enum {
+        SCREEN_WIDTH = 400,
+        SCREEN_HEIGHT = 240,
+        GAME_WIDTH = 320,
+        GAME_HEIGHT = 240,
+        X_OFFSET = 40
+    };
 
-    const u16 *rows[DH];
-    u16 fbw, fbh;
-    u16 *fb;
-    int x, y;
+    u16 fb_width;
+    u16 fb_height;
+    u16 *framebuffer;
+    unsigned x;
+    unsigned y;
 
-    if (!data || !w || !h)
+    if (!data || width == 0 || height == 0)
         return;
 
-    fb = (u16 *)gfxGetFramebuffer(
-        GFX_TOP, GFX_LEFT, &fbw, &fbh
+    framebuffer = (u16 *)gfxGetFramebuffer(
+        GFX_TOP, GFX_LEFT, &fb_width, &fb_height
     );
 
-    for (y = 0; y < DH; y++) {
-        rows[y] = (const u16 *)(
-            (const u8 *)data + (size_t)(y * h / DH) * pitch
-        );
-    }
+    if (!framebuffer || fb_width < SCREEN_WIDTH ||
+        fb_height < SCREEN_HEIGHT)
+        return;
 
-    for (x = 0; x < DW; x++) {
-        u16 *col = fb + (XOFF + x) * DH;
-        unsigned sx = (unsigned)x * w / DW;
+    /*
+     * libretro video data uses pitch bytes per source row.
+     * The 3DS framebuffer is column-major and vertically reversed.
+     */
+    for (x = 0; x < GAME_WIDTH; x++) {
+        unsigned source_x = x * width / GAME_WIDTH;
+        u16 *column = framebuffer + (X_OFFSET + x) * SCREEN_HEIGHT;
 
-        for (y = 0; y < DH; y++) {
-            col[DH - 1 - y] = rows[y][sx];
+        for (y = 0; y < GAME_HEIGHT; y++) {
+            unsigned source_y = y * height / GAME_HEIGHT;
+            const u16 *source_row = (const u16 *)(
+                (const uint8_t *)data + (size_t)source_y * pitch
+            );
+
+            column[SCREEN_HEIGHT - 1 - y] = source_row[source_x];
         }
     }
 }
@@ -146,7 +229,7 @@ static void video_cb(const void *data, unsigned w, unsigned h,
 static bool audio_init(void)
 {
     Result result;
-    int i;
+    unsigned i;
 
     memset(audio_wavebufs, 0, sizeof(audio_wavebufs));
     memset(audio_buffers, 0, sizeof(audio_buffers));
@@ -158,11 +241,9 @@ static bool audio_init(void)
 
     if (R_FAILED(result)) {
         if (logfile) {
-            fprintf(
-                logfile,
-                "[PSXctr] Audio: ndspInit failed: 0x%08lX\n",
-                (unsigned long)result
-            );
+            fprintf(logfile,
+                    "[PSXctr] Audio: ndspInit failed: 0x%08lX\n",
+                    (unsigned long)result);
             fflush(logfile);
         }
 
@@ -181,28 +262,24 @@ static bool audio_init(void)
 
     {
         float mix[12] = {0};
+
         mix[0] = 1.0f;
         mix[1] = 1.0f;
+
         ndspChnSetMix(0, mix);
     }
 
-    /*
-     * Allocate audio memory in linear memory, as required
-     * for reliable NDSP playback.
-     */
     for (i = 0; i < AUDIO_BUFFER_COUNT; i++) {
         audio_buffers[i] = (int16_t *)linearAlloc(
             AUDIO_BUFFER_FRAMES * 2 * sizeof(int16_t)
         );
 
         if (!audio_buffers[i]) {
-            int j;
+            unsigned j;
 
             if (logfile) {
-                fprintf(
-                    logfile,
-                    "[PSXctr] Audio: buffer allocation failed\n"
-                );
+                fprintf(logfile,
+                        "[PSXctr] Audio: buffer allocation failed\n");
                 fflush(logfile);
             }
 
@@ -219,10 +296,7 @@ static bool audio_init(void)
 
     audio_ready = true;
 
-    log_stage(
-        "Audio: NDSP initialized, stereo PCM16 at 44100 Hz"
-    );
-
+    log_stage("Audio: NDSP initialized, stereo PCM16 at 44100 Hz");
     return true;
 }
 
@@ -230,33 +304,26 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames)
 {
     size_t consumed = 0;
 
-    /*
-     * If audio is unavailable, continue emulation without
-     * blocking the core on sound output.
-     */
     if (!audio_ready || !data)
         return frames;
 
     while (consumed < frames) {
         int slot = -1;
-        int i;
+        unsigned i;
         size_t chunk;
         size_t bytes;
 
-        /*
-         * Find a buffer which NDSP has finished playing.
-         */
         for (i = 0; i < AUDIO_BUFFER_COUNT; i++) {
             if (audio_wavebufs[i].status == NDSP_WBUF_FREE ||
                 audio_wavebufs[i].status == NDSP_WBUF_DONE) {
-                slot = i;
+                slot = (int)i;
                 break;
             }
         }
 
         /*
-         * All buffers are busy. Return the number of frames
-         * actually queued instead of overwriting active audio.
+         * Do not overwrite a buffer currently being played.
+         * If all buffers are busy, return only the frames queued.
          */
         if (slot < 0)
             break;
@@ -266,20 +333,12 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames)
         if (chunk > AUDIO_BUFFER_FRAMES)
             chunk = AUDIO_BUFFER_FRAMES;
 
-        /*
-         * Each stereo frame contains two 16-bit samples.
-         */
         bytes = chunk * 2 * sizeof(int16_t);
 
-        memcpy(
-            audio_buffers[slot],
-            data + consumed * 2,
-            bytes
-        );
+        memcpy(audio_buffers[slot],
+               data + consumed * 2,
+               bytes);
 
-        /*
-         * Make CPU-written samples visible to the DSP.
-         */
         DSP_FlushDataCache(audio_buffers[slot], bytes);
 
         audio_wavebufs[slot].data_vaddr = audio_buffers[slot];
@@ -304,7 +363,7 @@ static void audio_cb(int16_t left, int16_t right)
 
 static void audio_shutdown(void)
 {
-    int i;
+    unsigned i;
 
     audio_ready = false;
 
@@ -338,14 +397,13 @@ static void input_poll_cb(void)
         quit_requested = 1;
 }
 
-static int16_t input_state_cb(
-    unsigned port,
-    unsigned device,
-    unsigned index,
-    unsigned id
-)
+static int16_t input_state_cb(unsigned port,
+                              unsigned device,
+                              unsigned index,
+                              unsigned id)
 {
     u32 held;
+
     (void)index;
 
     if (port != 0 || device != RETRO_DEVICE_JOYPAD)
@@ -405,36 +463,42 @@ static int16_t input_state_cb(
 /* Game file discovery                                        */
 /* --------------------------------------------------------- */
 
-static int has_ext(const char *name, const char *ext)
+static int has_ext(const char *name, const char *extension)
 {
-    size_t n = strlen(name);
-    size_t e = strlen(ext);
+    size_t name_length = strlen(name);
+    size_t extension_length = strlen(extension);
 
-    return n > e &&
-           strcasecmp(name + n - e, ext) == 0;
+    return name_length > extension_length &&
+           strcasecmp(name + name_length - extension_length,
+                      extension) == 0;
 }
 
-static int find_game(char *out, size_t cap)
+static int find_game(char *out, size_t capacity)
 {
-    DIR *dir = opendir(ROM_DIR);
-    struct dirent *ent;
+    DIR *directory = opendir(ROM_DIR);
+    struct dirent *entry;
 
-    if (!dir)
+    if (!directory)
         return 0;
 
-    while ((ent = readdir(dir)) != NULL) {
-        if (has_ext(ent->d_name, ".cue") ||
-            has_ext(ent->d_name, ".chd") ||
-            has_ext(ent->d_name, ".pbp") ||
-            has_ext(ent->d_name, ".iso")) {
+    while ((entry = readdir(directory)) != NULL) {
+        if (has_ext(entry->d_name, ".cue") ||
+            has_ext(entry->d_name, ".chd") ||
+            has_ext(entry->d_name, ".pbp") ||
+            has_ext(entry->d_name, ".iso")) {
+            int written = snprintf(out, capacity, "%s/%s",
+                                   ROM_DIR, entry->d_name);
 
-            snprintf(out, cap, "%s/%s", ROM_DIR, ent->d_name);
-            closedir(dir);
+            closedir(directory);
+
+            if (written < 0 || (size_t)written >= capacity)
+                return 0;
+
             return 1;
         }
     }
 
-    closedir(dir);
+    closedir(directory);
     return 0;
 }
 
@@ -458,13 +522,14 @@ static void wait_for_start(void)
 
 int main(void)
 {
-    char path[512];
+    char game_path[512];
 
     struct retro_game_info game;
     struct retro_system_av_info av;
 
-    u16 fbw, fbh;
-    u8 *fb;
+    u16 fb_width;
+    u16 fb_height;
+    u8 *framebuffer;
 
     log_stage("Startup: enabling 3DS speedup");
     osSetSpeedupEnable(true);
@@ -477,10 +542,17 @@ int main(void)
     consoleInit(GFX_BOTTOM, NULL);
 
     log_stage("Startup: clearing top screen");
-    fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fbw, &fbh);
-    memset(fb, 0, (size_t)fbw * fbh * 2);
+
+    framebuffer = gfxGetFramebuffer(
+        GFX_TOP, GFX_LEFT, &fb_width, &fb_height
+    );
+
+    if (framebuffer)
+        memset(framebuffer, 0,
+               (size_t)fb_width * fb_height * sizeof(u16));
 
     log_stage("Startup: creating application directories");
+
     mkdir(BASE_DIR, 0777);
     mkdir(SYSTEM_DIR, 0777);
     mkdir(SAVE_DIR, 0777);
@@ -490,17 +562,10 @@ int main(void)
     printf("PSXctr\n\n");
     log_stage("Startup: frontend initialized; log opened");
 
-    /*
-     * Start sound output before initializing the emulation core.
-     * If NDSP is unavailable, the emulator can still run silently.
-     */
     log_stage("Audio: initializing NDSP");
 
-    if (!audio_init()) {
-        log_stage(
-            "Audio: unavailable; continuing without sound"
-        );
-    }
+    if (!audio_init())
+        log_stage("Audio: unavailable; continuing without sound");
 
     log_stage("Core: registering environment callback");
     retro_set_environment(env_cb);
@@ -526,32 +591,26 @@ int main(void)
 
     log_stage("ROM: scanning sdmc:/roms/psx");
 
-    if (find_game(path, sizeof(path))) {
+    if (find_game(game_path, sizeof(game_path))) {
         memset(&game, 0, sizeof(game));
-        game.path = path;
+        game.path = game_path;
 
-        printf("Loading:\n%s\n\n", path);
+        printf("Loading:\n%s\n\n", game_path);
         log_stage("Core: entering retro_load_game");
 
         if (retro_load_game(&game)) {
-            log_stage(
-                "Core: retro_load_game completed successfully"
-            );
+            log_stage("Core: retro_load_game completed successfully");
 
             log_stage("Core: querying system AV information");
             retro_get_system_av_info(&av);
 
             log_stage("Core: setting joypad controller");
-            retro_set_controller_port_device(
-                0, RETRO_DEVICE_JOYPAD
-            );
+            retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
 
-            printf(
-                "Running %ux%u at %.2f fps\n",
-                av.geometry.base_width,
-                av.geometry.base_height,
-                av.timing.fps
-            );
+            printf("Running %ux%u at %.2f fps\n",
+                   av.geometry.base_width,
+                   av.geometry.base_height,
+                   av.timing.fps);
 
             printf("Exit: hold L+R+START+SELECT\n");
 
@@ -568,7 +627,6 @@ int main(void)
             log_stage("Core: unloading game");
             retro_unload_game();
             log_stage("Core: game unloaded");
-
         } else {
             log_stage("Core: retro_load_game failed");
 
@@ -578,7 +636,6 @@ int main(void)
 
             wait_for_start();
         }
-
     } else {
         log_stage("ROM: no supported game file found");
 
